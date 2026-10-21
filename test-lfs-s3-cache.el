@@ -1,0 +1,57 @@
+;;; test-lfs-s3-cache.el --- integration checks -*- lexical-binding: t; -*-
+;; SPDX-License-Identifier: GPL-3.0-or-later
+(require 'ert)
+(require 'org)
+(require 'citar-file)
+(setq load-prefer-newer t)
+(require 'lfs-s3-cache)
+
+(setq lfs-s3-cache-repositories (list (getenv "LFS_CACHE_TEST_REPO"))
+      lfs-s3-cache-program (getenv "LFS_CACHE_TEST_PROGRAM"))
+(lfs-s3-cache-mode 1)
+
+(ert-deftest lfs-cache-expands-repository-for-subprocess ()
+  (let (captured)
+    (cl-letf (((symbol-function 'process-file)
+               (lambda (_program _input _destination _display &rest args)
+                 (setq captured args) 0)))
+      (lfs-s3-cache--call "~/resources" "status"))
+    (should (equal (cadr captured) (expand-file-name "~/resources")))))
+
+(ert-deftest lfs-cache-citar-discovery-and-opening ()
+  (let* ((repo (car lfs-s3-cache-repositories))
+         (file (expand-file-name "files/library/paper.pdf" repo))
+         (dirs (list (file-name-directory file)))
+         (citar-file-open-functions '((t . ignore))))
+    (should-not (file-exists-p file))
+    (should (equal (mapcar #'file-truename dirs) (citar-file--normalize-paths dirs)))
+    (should (member file (gethash "paper" (citar-file--directory-files dirs '("paper") '("pdf")))))
+    (should (member file (gethash "paper" (citar-file--directory-files dirs nil '("pdf")))))
+    (should (equal (list file) (citar-file--find-files-in-dirs '("paper.pdf") dirs)))
+    (citar-file-open file)
+    (should (file-exists-p file))
+    ;; Warm Citar opens still update the access clock.
+    (citar-file-open file)
+    (lfs-s3-cache--call repo "gc" "--apply" "--path" file "--pilot")
+    (should-not (file-exists-p file))))
+
+(ert-deftest lfs-cache-org-opening ()
+  (let* ((repo (car lfs-s3-cache-repositories))
+         (file (expand-file-name "files/library/paper.pdf" repo))
+         (org-file-apps '(("pdf" . (lambda (_file _link) t)))))
+    (should-not (file-exists-p file))
+    (with-temp-buffer
+      (org-mode)
+      (insert (format "[[file:%s]]" file))
+      (goto-char (point-min))
+      (org-open-at-point))
+    (should (file-exists-p file))
+    (org-open-file file)))
+
+(ert-deftest lfs-cache-unmanaged-citar-opening ()
+  (let* ((seen nil)
+        (citar-file-open-functions `((t . ,(lambda (file) (setq seen file))))))
+    (citar-file-open "/tmp/unmanaged.pdf")
+    (should (equal seen "/tmp/unmanaged.pdf"))))
+
+(ert-run-tests-batch-and-exit)

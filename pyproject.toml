@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lfs-s3-cache"
+version = "0.1.0"
+description = "Optional local cache management for Git LFS files stored through lfs-s3"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["COPYING"]
+requires-python = ">=3.10"
+
+[project.scripts]
+lfs-s3-cache = "lfs_s3_cache:main"
+lfs-s3-cache-daily = "lfs_s3_cache_daily:main"
+
+[tool.setuptools]
+py-modules = ["lfs_s3_cache", "lfs_s3_cache_daily"]
+
+[tool.setuptools.data-files]
+"share/emacs/site-lisp/lfs-s3-cache" = ["lfs-s3-cache.el"]
