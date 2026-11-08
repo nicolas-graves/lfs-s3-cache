@@ -59,6 +59,7 @@ lfs-s3-cache --repo ~/resources hydrate files/library/citekey.pdf
 lfs-s3-cache --repo ~/resources pin files/library/citekey.pdf
 lfs-s3-cache --repo ~/resources unpin files/library/citekey.pdf
 lfs-s3-cache --repo ~/resources sync
+lfs-s3-cache --repo ~/resources adopt   # only after an external sparse-checkout disable
 lfs-s3-cache --repo ~/resources gc --apply --max-files 5
 ```
 
@@ -109,6 +110,29 @@ paths. It preserves unrelated staged and unstaged edits. A failed remote check
 leaves both local copies intact. Do not run other Git writes during a GC or
 hydration operation: the cache serializes its own commands, not arbitrary Git
 processes. Git index locks and checks around transfers provide additional guards.
+
+**Never run `git sparse-checkout disable` or `git sparse-checkout set` on a
+managed repository** (outside the retirement procedure below). The cache owns
+its sparse-checkout patterns; changing them behind its back makes every command,
+including the daily job, fail closed. Use `hydrate` to restore a cold document
+and `pin` to keep it local.
+
+If sparse checkout was nevertheless disabled and the cold files were restored
+that way, commands report `cache sparse checkout disabled outside lfs-s3-cache`.
+Recover explicitly with:
+
+```sh
+lfs-s3-cache --repo ~/resources adopt
+```
+
+`adopt` is never automatic. It refuses, listing the offending paths, unless the
+state has no pending transition; sparse checkout is disabled (not cone mode)
+and its pattern file is absent or still the cache's own; no index entry is
+skip-worktree; and every cold path is still a tracked pointer whose working file
+is a regular, clean file matching the *index* pointer's size and SHA-256. On
+success it re-enables the cache's sparse checkout with no exclusions, gives the
+adopted files a fresh clock, and reconciles the catalog. Restore or commit
+edited, missing, or pointer-only files first.
 
 Untracked documents and documents with staged or unstaged changes are protected.
 Staging alone never makes a document eligible: finish, commit, and push new or

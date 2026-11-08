@@ -173,22 +173,37 @@ class Cache:
     def valid(path, oid, size):
         return not path.is_symlink() and path.is_file() and path.stat().st_size == size and sha256(path) == oid
 
-    def guard_sparse(self, initializing=False):
+    def guard_storage(self):
         worktrees = self.git("worktree", "list", "--porcelain").stdout.splitlines()
         if sum(line.startswith(b"worktree ") for line in worktrees) != 1:
             raise CacheError("multiple worktrees share this Git LFS store")
         if self.media != self.gitdir / "lfs/objects" or (self.gitdir / "lfs").is_symlink() or (self.gitdir / "lfs/objects").is_symlink():
             raise CacheError("nonstandard or shared Git LFS storage")
-        sparse = self.git("config", "--bool", "core.sparseCheckout", check=False).stdout.strip() == b"true"
+
+    def config_true(self, key):
+        # Through git config, so worktree-specific configuration is honoured.
+        return self.git("config", "--bool", key, check=False).stdout.strip() == b"true"
+
+    def skip_worktree(self):
+        flags = self.git("ls-files", "-t", "-z").stdout.split(b"\0")
+        return [os.fsdecode(f[2:]) for f in flags if f.startswith(b"S ")]
+
+    def guard_sparse(self, initializing=False):
+        self.guard_storage()
+        sparse = self.config_true("core.sparseCheckout")
         if initializing and not self.state.get("active"):
             if sparse or self.sparse_file.exists():
                 raise CacheError("existing sparse checkout is not managed by lfs-s3-cache")
-            flags = self.git("ls-files", "-t", "-z").stdout.split(b"\0")
-            if any(f.startswith(b"S ") for f in flags):
+            if self.skip_worktree():
                 raise CacheError("unmanaged skip-worktree entries")
             return
-        if not sparse or self.git("config", "--bool", "core.sparseCheckoutCone", check=False).stdout.strip() == b"true":
-            raise CacheError("cache sparse checkout disabled or changed")
+        if self.config_true("core.sparseCheckoutCone"):
+            raise CacheError("cache sparse checkout switched to cone mode outside lfs-s3-cache; "
+                             "restore non-cone patterns by hand (adopt refuses this case)")
+        if not sparse:
+            raise CacheError("cache sparse checkout disabled outside lfs-s3-cache "
+                             "(e.g. 'git sparse-checkout disable'); if the cold files were "
+                             f"restored, run 'lfs-s3-cache --repo {self.root} adopt'")
         allowed = [patterns(self.state["excluded"])]
         if self.state.get("pending"):
             allowed.append(patterns(self.state["pending"]["after"]))
@@ -248,6 +263,57 @@ class Cache:
     def finish_transition(self):
         self.state["excluded"] = self.state.pop("pending")["after"]
         self.save()
+
+    def adopt(self, catalog):
+        """Accept files restored outside the cache after sparse checkout was disabled.
+
+        Never automatic: only an explicit command may turn an externally
+        disabled sparse checkout back into managed, warm files.
+        """
+        if not self.state.get("active"):
+            raise CacheError("run 'lfs-s3-cache activate' first")
+        if self.state.get("pending"):
+            raise CacheError("an interrupted cache transition is pending; inspect state before adopting")
+        self.guard_storage()
+        if self.config_true("core.sparseCheckout"):
+            raise CacheError("sparse checkout is enabled; adopt only applies after it was disabled")
+        if self.config_true("core.sparseCheckoutCone"):
+            raise CacheError("cone-mode sparse checkout is not managed by lfs-s3-cache; refusing to adopt")
+        expected = patterns(self.state["excluded"])
+        if self.sparse_file.exists() and (not self.sparse_file.is_file()
+                                          or self.sparse_file.read_text() != expected):
+            raise CacheError("sparse checkout patterns changed outside lfs-s3-cache; refusing to adopt")
+        problems = [f"skip-worktree entry: {p}" for p in self.skip_worktree()]
+        for rel in self.state["excluded"]:
+            if rel not in catalog:
+                problems.append(f"no longer a tracked LFS pointer: {rel}")
+            else:
+                try:
+                    if not self.clean_candidate(rel, *catalog[rel]):
+                        problems.append(f"missing, modified, or not matching the index: {rel}")
+                except CacheError as exc:
+                    problems.append(str(exc))
+        if problems:
+            raise CacheError("refusing to adopt:\n  " + "\n  ".join(problems))
+        adopted = list(self.state["excluded"])
+        before = self.sparse_file.read_text() if self.sparse_file.is_file() else expected
+        self.state["pending"] = {"after": [], "before_patterns": before}
+        self.save()
+        try:
+            self.apply_sparse([])
+        except CacheError:
+            del self.state["pending"]
+            self.save()
+            raise
+        now = time.time()
+        for rel in adopted:
+            self.state["files"][rel]["opened"] = now
+        self.finish_transition()
+        if (not self.config_true("core.sparseCheckout") or self.config_true("core.sparseCheckoutCone")
+                or self.sparse_file.read_text() != patterns([]) or self.skip_worktree()):
+            raise CacheError("sparse checkout was not re-enabled as expected after adopt")
+        self.reconcile(self.catalog())
+        return adopted
 
     def activate(self, catalog):
         if self.state.get("active"):
@@ -465,7 +531,7 @@ def main(argv=None):
     parser.add_argument("--state-dir", help="override XDG state directory")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status").add_argument("--json", action="store_true")
-    for name in ("activate", "sync"):
+    for name in ("activate", "sync", "adopt"):
         sub.add_parser(name)
     for name in ("hydrate", "pin", "unpin"):
         sub.add_parser(name).add_argument("path")
@@ -485,6 +551,11 @@ def main(argv=None):
     try:
         cache = Cache(args.repo, args.state_dir)
         catalog = cache.catalog()
+        if args.command == "adopt":
+            # Before the generic reconcile, which fails closed on this state.
+            adopted = cache.adopt(catalog)
+            print(f"adopted {len(adopted)} restored files; sparse checkout re-enabled")
+            return 0
         cache.reconcile(catalog)
         if args.command == "status":
             cache.status(catalog, args.json)

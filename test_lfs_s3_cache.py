@@ -343,6 +343,75 @@ class Integration(unittest.TestCase):
         with self.assertRaises(mod.CacheError):
             self.cache.reconcile(self.catalog)
 
+    def cli(self, *args):
+        """Run the CLI in-process; the caller must release self.cache's lock."""
+        out, err = tempfile.TemporaryFile('w+'), tempfile.TemporaryFile('w+')
+        with patch.object(sys, 'stdout', out), patch.object(sys, 'stderr', err):
+            code = mod.main(['--repo', str(self.repo), '--state-dir', str(self.base / 'state'), *args])
+        out.seek(0)
+        err.seek(0)
+        return code, out.read(), err.read()
+
+    def replay_sparse_disable(self):
+        """The 2026-10-31 incident: restore a cold file by disabling sparse checkout."""
+        self.evict(pilot=True, only=self.path)
+        self.assertFalse((self.repo / self.path).exists())
+        self.cache.close()
+        self.git('sparse-checkout', 'disable')
+        self.assertEqual((self.repo / self.path).read_bytes(), self.content)
+        origin = self.git('config', '--show-origin', '--bool', 'core.sparseCheckout')
+        self.assertIn(b'config.worktree', origin)
+        self.assertTrue(origin.rstrip().endswith(b'false'))
+        self.assertIn(self.path, self.cache.sparse_file.read_text())
+
+    def test_adopt_after_sparse_checkout_disable(self):
+        self.replay_sparse_disable()
+        for args in (('status',), ('sync',), ('gc', '--dry-run')):
+            code, _, err = self.cli(*args)
+            self.assertEqual(code, 1, args)
+            self.assertIn('adopt', err, args)
+        code, out, err = self.cli('adopt')
+        self.assertEqual(code, 0, err)
+        self.assertIn('adopted 1', out)
+        self.assertEqual((self.repo / self.path).read_bytes(), self.content)
+        self.assertEqual(self.git('config', '--bool', 'core.sparseCheckout').strip(), b'true')
+        self.assertEqual(self.cache.sparse_file.read_text(), mod.patterns([]))
+        state = json.loads(self.cache.state_path.read_text())
+        self.assertEqual(state['excluded'], [])
+        self.assertNotIn('pending', state)
+        self.assertGreater(state['files'][self.path]['opened'], time.time() - 10)
+        self.assertEqual(self.git('status', '--porcelain'), b'')
+        for args in (('status',), ('gc', '--dry-run')):
+            code, _, err = self.cli(*args)
+            self.assertEqual(code, 0, (args, err))
+        code, _, err = self.cli('adopt')
+        self.assertEqual(code, 1)
+        self.assertIn('sparse checkout is enabled', err)
+
+    def adopt_refused(self, needle):
+        files = [self.cache.state_path, self.cache.sparse_file, self.repo / '.git/config.worktree']
+        before = [f.read_bytes() for f in files]
+        code, _, err = self.cli('adopt')
+        self.assertEqual(code, 1)
+        self.assertIn(needle, err)
+        self.assertEqual([f.read_bytes() for f in files], before)
+
+    def test_adopt_refuses_pointer_left_behind(self):
+        self.replay_sparse_disable()
+        (self.repo / self.path).write_bytes(mod.pointer(self.oid, self.size))
+        self.adopt_refused(self.path)
+
+    def test_adopt_refuses_edited_file(self):
+        self.replay_sparse_disable()
+        self.write(self.path, b'edited after restore')
+        self.adopt_refused(self.path)
+        self.assertEqual((self.repo / self.path).read_bytes(), b'edited after restore')
+
+    def test_adopt_refuses_foreign_patterns(self):
+        self.replay_sparse_disable()
+        self.cache.sparse_file.write_text('/*\n!/unrelated\n')
+        self.adopt_refused('patterns changed')
+
     def test_multiple_worktrees_and_shared_storage_refused(self):
         self.git('worktree', 'add', '--detach', str(self.base / 'other'))
         with self.assertRaises(mod.CacheError):
